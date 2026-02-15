@@ -92,6 +92,7 @@ class CellList:
   """
   position_buffer: Array
   id_buffer: Array
+  particle_cell_id: Array
   named_buffer: Dict[str, Array]
 
   did_buffer_overflow: Array
@@ -198,6 +199,13 @@ def _neighboring_cells(dimension: int) -> Generator[onp.ndarray, None, None]:
     yield onp.array(dindex, dtype=i32) - 1
 
 
+@partial(jit, static_argnums=(0,1))
+def _neighboring_cells_arr(ndim: int, dist: int=1) -> Array:  
+  return jnp.stack(
+      [lax.broadcasted_iota(i32, [dist*2+1]*ndim, d)-dist for d in range(ndim)],
+      axis=-1).reshape((-1, ndim))
+
+
 def _estimate_cell_capacity(position: Array,
                             box_size: Box,
                             cell_size: float,
@@ -246,7 +254,7 @@ def unflatten_cell_buffer(arr: Array,
     raise ValueError()
   return jnp.reshape(arr, cells_per_side + (-1,) + arr.shape[1:])
 
-
+@jax.profiler.annotate_function
 def cell_list(box_size: Box,
               minimum_cell_size: float,
               buffer_size_multiplier: float = 1.25
@@ -355,7 +363,7 @@ def cell_list(box_size: Box,
       cell_kwargs[k] = empty_kwarg_value * jnp.ones(
           (cell_count * cell_capacity,) + kwarg_shape, v.dtype)
     #  pytype: enable=attribute-error
-    indices = jnp.array(position / cell_size, dtype=i32)
+    indices = jnp.array(jnp.mod(position, box_size) / cell_size, dtype=i32)
     hashes = jnp.sum(indices * hash_multipliers, axis=1)
 
     # Copy the particle data into the grid. Here we use a trick to allow us to
@@ -365,36 +373,40 @@ def cell_list(box_size: Box,
     # grid_id is a flat list that repeats 0, .., cell_capacity. So long as
     # there are fewer than cell_capacity particles per cell, each particle is
     # guaranteed to get a cell id that is unique.
-    sort_map = jnp.argsort(hashes)
-    sorted_position = position[sort_map]
-    sorted_hash = hashes[sort_map]
-    sorted_id = particle_id[sort_map]
+    with jax.named_scope("cell_list_argsort"):
+      sort_map = jnp.argsort(hashes)
+    with jax.named_scope("cell_list_sort"):
+      sorted_position = position[sort_map]
+      sorted_hash = hashes[sort_map]
+      sorted_id = particle_id[sort_map]
 
-    sorted_kwargs = {}
-    for k, v in kwargs.items():
-      sorted_kwargs[k] = v[sort_map]
+      sorted_kwargs = {}
+      for k, v in kwargs.items():
+        sorted_kwargs[k] = v[sort_map]
 
-    sorted_cell_id = jnp.mod(lax.iota(i32, N), cell_capacity)
-    sorted_cell_id = sorted_hash * cell_capacity + sorted_cell_id
+    with jax.named_scope("cell_list_idcalc"):
 
-    cell_position = cell_position.at[sorted_cell_id].set(sorted_position)
-    sorted_id = jnp.reshape(sorted_id, (N, 1))
-    cell_id = cell_id.at[sorted_cell_id].set(sorted_id)
-    cell_position = unflatten_cell_buffer(cell_position, cells_per_side, dim)
-    cell_id = unflatten_cell_buffer(cell_id, cells_per_side, dim)
+      sorted_cell_id = jnp.mod(lax.iota(i32, N), cell_capacity)
+      sorted_cell_id = sorted_hash * cell_capacity + sorted_cell_id
 
-    for k, v in sorted_kwargs.items():
-      if v.ndim == 1:
-        v = jnp.reshape(v, v.shape + (1,))
-      cell_kwargs[k] = cell_kwargs[k].at[sorted_cell_id].set(v)
-      cell_kwargs[k] = unflatten_cell_buffer(
-          cell_kwargs[k], cells_per_side, dim)
+      cell_position = cell_position.at[sorted_cell_id].set(sorted_position)
+      sorted_id = jnp.reshape(sorted_id, (N, 1))
+      cell_id = cell_id.at[sorted_cell_id].set(sorted_id)
+      cell_position = unflatten_cell_buffer(cell_position, cells_per_side, dim)
+      cell_id = unflatten_cell_buffer(cell_id, cells_per_side, dim)
+
+      for k, v in sorted_kwargs.items():
+        if v.ndim == 1:
+          v = jnp.reshape(v, v.shape + (1,))
+        cell_kwargs[k] = cell_kwargs[k].at[sorted_cell_id].set(v)
+        cell_kwargs[k] = unflatten_cell_buffer(
+            cell_kwargs[k], cells_per_side, dim)
 
     occupancy = ops.segment_sum(jnp.ones_like(hashes), hashes, cell_count)
     max_occupancy = jnp.max(occupancy)
     overflow = overflow | (max_occupancy > cell_capacity)
 
-    return CellList(cell_position, cell_id, cell_kwargs,
+    return CellList(cell_position, cell_id, indices, cell_kwargs,
                     overflow, cell_capacity, cell_size, update_fn)  # pytype: disable=wrong-arg-count
 
   def allocate_fn(position: Array, extra_capacity: int = 0, **kwargs
@@ -795,31 +807,254 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
     return jnp.broadcast_to(candidates[None, :],
                             (positionShape[0], positionShape[0]))
 
-  @partial(jit, static_argnums=1)
-  def cell_list_candidate_fn(cl_id_buffer, positionShape) -> Array:
+  # ##original
+  # @jax.profiler.annotate_function
+  # @partial(jit, static_argnums=2)
+  # def cell_list_candidate_fn(cl_id_buffer,_, positionShape) -> Array:
+  #   N, dim = positionShape
+
+  #   idx = cl_id_buffer
+
+  #   cell_idx = [idx]
+
+  #   for dindex in _neighboring_cells(dim):
+  #     if onp.all(dindex == 0):
+  #       continue
+  #     cell_idx += [shift_array(idx, dindex)]
+
+  #   cell_idx = jnp.concatenate(cell_idx, axis=-2)
+  #   cell_idx = cell_idx[..., jnp.newaxis, :, :]
+  #   cell_idx = jnp.broadcast_to(cell_idx, idx.shape[:-1] + cell_idx.shape[-2:])
+
+  #   def copy_values_from_cell(value, cell_value, cell_id):
+  #     scatter_indices = jnp.reshape(cell_id, (-1,))
+  #     cell_value = jnp.reshape(cell_value, (-1,) + cell_value.shape[-2:])
+  #     return value.at[scatter_indices].set(cell_value)
+
+  #   neighbor_idx = jnp.zeros((N + 1,) + cell_idx.shape[-2:], i32)
+  #   neighbor_idx = copy_values_from_cell(neighbor_idx, cell_idx, idx)
+  #   return neighbor_idx[:-1, :, 0]
+
+
+  # @jax.profiler.annotate_function
+  # @partial(jit, static_argnums=1)
+  # def cell_list_candidate_fn(cl_id_buffer, positionShape) -> Array:
+  #   N, dim = positionShape
+
+  #   idx = cl_id_buffer
+
+  #   cell_idx = [idx]
+
+  #   for dindex in _neighboring_cells(dim):
+  #     if onp.all(dindex == 0):
+  #       continue
+  #     cell_idx += [shift_array(idx, dindex)]
+
+  #   cell_idx = jnp.concatenate(cell_idx, axis=-2)
+  #   cell_idx = cell_idx[..., jnp.newaxis, :, :]
+  #   cell_idx = jnp.broadcast_to(cell_idx, idx.shape[:-1] + cell_idx.shape[-2:])
+
+  #   # def copy_values_from_cell(value, cell_value, cell_id):
+  #   #   scatter_indices = jnp.reshape(cell_id, (-1,))
+  #   #   cell_value = jnp.reshape(cell_value, (-1,) + cell_value.shape[-2:])
+  #   #   return value.at[scatter_indices].set(cell_value)
+
+  #   neighbor_idx = jnp.zeros((N + 1,) + cell_idx.shape[-2:], i32)
+  #   #neighbor_idx = copy_values_from_cell(neighbor_idx, cell_idx, idx)
+  #   scatter_indices = jnp.reshape(idx, (-1,))
+  #   cell_value = jnp.reshape(cell_idx, (-1,) + cell_idx.shape[-2:])
+  #   neighbor_idx = neighbor_idx.at[scatter_indices].set(cell_value)
+
+  #   # scatter_indices = jnp.reshape(idx, (-1,))
+    
+  #   # cell_value = jnp.reshape(cell_idx, (-1,) + cell_idx.shape[-2:])
+  #   # cell_value = jnp.repeat(cell_value, idx.shape[-1], axis=0)
+
+  #   # sort_map = jnp.argsort(scatter_indices)
+  #   # cell_value = cell_value.at[sort_map].set(cell_value)
+
+  #   return neighbor_idx
+
+  # @jax.profiler.annotate_function
+  # @partial(jit, static_argnums=1)
+  # def cell_list_candidate_fn(cl_id_buffer, positionShape) -> Array:
+  #   N, dim = positionShape
+  #   cell_capacity = cl_id_buffer.shape[dim]
+
+  #   neighbors_per_cell = []
+  #   for dindex in _neighboring_cells(dim):
+  #   # for dindex in _neighboring_cells_arr(dim):
+  #     neighbors_per_cell += [shift_array(cl_id_buffer, dindex).reshape((-1, cell_capacity))]
+  #   neighbors_per_cell = jnp.concatenate(neighbors_per_cell, axis=1)
+  #   n_neighbors_per_particle = neighbors_per_cell.shape[-1]
+
+  #   neighbors_per_particle = jnp.repeat(neighbors_per_cell, cell_capacity, axis=0)
+  #   neighbors_per_particle_sorted = jnp.zeros((N, n_neighbors_per_particle), i32) 
+    
+  #   particles_per_cell = cl_id_buffer.reshape((-1, cell_capacity))
+  #   sort_map = jnp.argsort(particles_per_cell)
+
+  #   neighbors_per_particle_sorted = neighbors_per_particle_sorted.at[sort_map].set(neighbors_per_particle)
+
+  #   return neighbors_per_particle_sorted[:N]
+  
+
+  # @jax.profiler.annotate_function
+  # @partial(jit, static_argnums=1)
+  # def cell_list_candidate_fn(cl_id_buffer, positionShape) -> Array:
+  #   N, dim = positionShape
+  #   cell_capacity = cl_id_buffer.shape[dim]
+
+  #   particles_per_cell = cl_id_buffer.reshape((-1,))
+  #   sort_map = jnp.argsort(particles_per_cell)[:N]
+  #   cell_id_per_cell = lax.broadcasted_iota(i32, (N, cell_capacity), 0).reshape((-1,))
+  #   cell_id_per_particle = cell_id_per_cell.at[sort_map].get()
+    
+  #   neighbors_per_particle = []
+  #   for dindex in _neighboring_cells(dim):
+  #     neighbors_per_particle += [shift_array(cl_id_buffer, dindex).reshape((-1, cell_capacity)).at[cell_id_per_particle].get()]
+  #   neighbors_per_particle = jnp.concatenate(neighbors_per_particle, axis=1)
+
+  #   return neighbors_per_particle
+
+  # @jax.profiler.annotate_function
+  # @partial(jit, static_argnums=1)
+  # def cell_list_candidate_fn(cl_id_buffer, positionShape) -> Array:
+  #   N, dim = positionShape
+
+  #   cell_capacity = cl_id_buffer.shape[dim]
+  #   cells_per_side = jnp.array(cl_id_buffer.shape[:dim], i32)
+  
+  #   flatten_cell_list = cl_id_buffer.reshape((-1, cell_capacity))
+
+  #   hash_multipliers = jnp.array([cells_per_side[1]*cells_per_side[2], cells_per_side[2], 1], i32)
+
+  #   particles_per_cell = cl_id_buffer.reshape((-1,))
+  #   #sort_map = jnp.argsort(particles_per_cell)[:N]
+
+  #   particles_per_cell = cl_id_buffer.reshape((-1,))
+  #   _, sort_map = jax.lax.top_k(-particles_per_cell, N)
+
+  #   cell_1did_per_cell = lax.broadcasted_iota(i32, (N, cell_capacity), 0).reshape((-1,))
+  #   cell_1did_per_particle = cell_1did_per_cell.at[sort_map].get()
+  #   #cell_3did_per_particle = jnp.column_stack(jnp.unravel_index(cell_1did_per_particle, cells_per_side)[:dim])
+  #   cell_3did_per_particle = jnp.column_stack([
+  #       (cell_1did_per_particle // cells_per_side[1]*cells_per_side[2]),
+  #       ((cell_1did_per_particle % cells_per_side[1]*cells_per_side[2]) // cells_per_side[2]),
+  #       (cell_1did_per_particle % cells_per_side[2])])
+
+
+  #   shifts = _neighboring_cells_arr(dim)
+  #   cell_3did_per_particle_shifted = cell_3did_per_particle[:, jnp.newaxis, :] + shifts[jnp.newaxis, :, :]
+  #   cell_3did_per_particle_shifted = cell_3did_per_particle_shifted.reshape((-1, dim))
+  #   cell_3did_per_particle_shifted = jnp.mod(cell_3did_per_particle_shifted, cells_per_side)
+  #   cell_1did_per_particle_shifted = jnp.sum(cell_3did_per_particle_shifted * hash_multipliers, axis=1)
+
+  #   neighbors_per_particle = flatten_cell_list.at[cell_1did_per_particle_shifted].get()
+    
+  #   reshaped_matrix = jax.lax.reshape(neighbors_per_particle, (shifts.shape[0], N, neighbors_per_particle.shape[-1]))
+    
+  #   # Transpose the reshaped matrix to (K/L, L, M)
+  #   transposed_matrix = jax.lax.transpose(reshaped_matrix, (1, 0, 2))
+
+  #   # Reshape the transposed matrix to (K/L, M*L)
+  #   result = jax.lax.reshape(transposed_matrix, (N, shifts.shape[0]*neighbors_per_particle.shape[-1]))
+
+  #   return result
+
+  # @jax.profiler.annotate_function
+  # @partial(jit, static_argnums=2)
+  # def cell_list_candidate_fn(cl_id_buffer, cell_3did_per_particle, positionShape) -> Array:
+  #   N, dim = positionShape
+
+  #   cell_capacity = cl_id_buffer.shape[dim]
+  #   cells_per_side = jnp.array(cl_id_buffer.shape[:dim], i32)
+  
+  #   flatten_cell_list = cl_id_buffer.reshape((-1, cell_capacity))
+
+  #   hash_multipliers = jnp.array([cells_per_side[1]*cells_per_side[2], cells_per_side[2], 1], i32)
+    
+  #   shifts = _neighboring_cells_arr(dim)
+  #   cell_3did_per_particle_shifted = cell_3did_per_particle[:, jnp.newaxis, :] + shifts[jnp.newaxis, :, :]
+  #   cell_3did_per_particle_shifted = cell_3did_per_particle_shifted.reshape((-1, dim))
+  #   cell_3did_per_particle_shifted = jnp.mod(cell_3did_per_particle_shifted, cells_per_side)
+  #   cell_1did_per_particle_shifted = jnp.sum(cell_3did_per_particle_shifted * hash_multipliers, axis=1)
+
+  #   neighbors_per_particle = flatten_cell_list[cell_1did_per_particle_shifted]
+    
+  #   reshaped_matrix = jax.lax.reshape(neighbors_per_particle, (shifts.shape[0], N, neighbors_per_particle.shape[-1]))
+    
+  #   # Transpose the reshaped matrix to (K/L, L, M)
+  #   transposed_matrix = jax.lax.transpose(reshaped_matrix, (1, 0, 2))
+
+  #   # Reshape the transposed matrix to (K/L, M*L)
+  #   result = jax.lax.reshape(transposed_matrix, (N, shifts.shape[0]*neighbors_per_particle.shape[-1]))
+
+  #   return result
+
+  # @jax.profiler.annotate_function
+  # @partial(jit, static_argnums=2)  
+  # def cell_list_candidate_fn(cl_id_buffer, cell_3did_per_particle, positionShape) -> Array:
+  #   N, dim = positionShape
+
+  #   cell_capacity = cl_id_buffer.shape[dim]
+  #   cells_per_side = jnp.array(cl_id_buffer.shape[:dim], i32)
+
+  #   shifts = _neighboring_cells_arr(dim)
+  #   cell_3did_per_particle_shifted = cell_3did_per_particle[:, jnp.newaxis, :] + shifts[jnp.newaxis, :, :]
+  #   cell_3did_per_particle_shifted = jnp.mod(cell_3did_per_particle_shifted, cells_per_side[None, None, :])
+
+  #   #hash_multipliers = jnp.array([cells_per_side[1]*cells_per_side[2], cells_per_side[2], 1], i32)
+  #   hash_multipliers = jnp.array([1, cells_per_side[2], cells_per_side[1]*cells_per_side[2]], i32)
+    
+  #   cell_1did_per_particle_shifted = jnp.sum(cell_3did_per_particle_shifted * hash_multipliers[None, None, :], axis=2)
+
+  #   flat_cell_list = cl_id_buffer.reshape((-1, cell_capacity))
+  #   neighbors_per_particle = flat_cell_list[cell_1did_per_particle_shifted.reshape(-1,)]
+    
+  #   result = neighbors_per_particle.reshape((N, shifts.shape[0]*cell_capacity,), order='C')
+  #   return result
+
+
+  @jax.profiler.annotate_function
+  @partial(jit, static_argnums=(2,3))  
+  def cell_list_candidate_fn(cl_id_buffer, cell_3did_per_particle, positionShape, metric_sq, position, position_buffer) -> Array:
     N, dim = positionShape
 
-    idx = cl_id_buffer
+    cell_capacity = cl_id_buffer.shape[dim]
+    cells_per_side = jnp.array(cl_id_buffer.shape[:dim], i32)
 
-    cell_idx = [idx]
+    shifts = _neighboring_cells_arr(dim)
+    cell_3did_per_particle_shifted = cell_3did_per_particle[:, jnp.newaxis, :] + shifts[jnp.newaxis, :, :]
+    cell_3did_per_particle_shifted = jnp.mod(cell_3did_per_particle_shifted, cells_per_side[None, None, :])
 
-    for dindex in _neighboring_cells(dim):
-      if onp.all(dindex == 0):
-        continue
-      cell_idx += [shift_array(idx, dindex)]
+    #hash_multipliers = jnp.array([cells_per_side[1]*cells_per_side[2], cells_per_side[2], 1], i32)
+    hash_multipliers = jnp.array([1, cells_per_side[2], cells_per_side[1]*cells_per_side[2]], i32)
+    
+    cell_1did_per_particle_shifted = jnp.sum(cell_3did_per_particle_shifted * hash_multipliers[None, None, :], axis=2)
 
-    cell_idx = jnp.concatenate(cell_idx, axis=-2)
-    cell_idx = cell_idx[..., jnp.newaxis, :, :]
-    cell_idx = jnp.broadcast_to(cell_idx, idx.shape[:-1] + cell_idx.shape[-2:])
+    flat_cell_list = cl_id_buffer.reshape((-1, cell_capacity))
+    neighbors_per_particle = flat_cell_list[cell_1did_per_particle_shifted.reshape(-1,)]
+    
+    result = neighbors_per_particle.reshape((N, shifts.shape[0]*cell_capacity,), order='C')
 
-    def copy_values_from_cell(value, cell_value, cell_id):
-      scatter_indices = jnp.reshape(cell_id, (-1,))
-      cell_value = jnp.reshape(cell_value, (-1,) + cell_value.shape[-2:])
-      return value.at[scatter_indices].set(cell_value)
+    flat_position_buffer = position_buffer.reshape((-1, cell_capacity, dim))
+    neighbor_positions_per_particle = flat_position_buffer[cell_1did_per_particle_shifted.reshape(-1,)]
+    neighbor_positions_per_particle = neighbor_positions_per_particle.reshape((N, shifts.shape[0]*cell_capacity, dim))
 
-    neighbor_idx = jnp.zeros((N + 1,) + cell_idx.shape[-2:], i32)
-    neighbor_idx = copy_values_from_cell(neighbor_idx, cell_idx, idx)
-    return neighbor_idx[:-1, :, 0]
+    d = partial(metric_sq)
+    d = space.map_bond(d)
+    position_reshaped = jnp.broadcast_to(position[:, None, :], neighbor_positions_per_particle.shape)
+    dR = d(
+      position_reshaped.reshape(-1, dim),
+      neighbor_positions_per_particle.reshape(-1, dim)
+      ).reshape((N, shifts.shape[0]*cell_capacity))
+    mask = dR < cutoff_sq
+    result = jnp.where(mask, result, N)
+
+
+    return result
+
 
   @jit
   def mask_self_fn(idx: Array) -> Array:
@@ -848,6 +1083,8 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
 
     return out_idx, max_occupancy
 
+  # optimize for the case of known max capacity
+  @jax.profiler.annotate_function
   @jit
   def prune_neighbor_list_sparse(position: Array, idx: Array, **kwargs
                                  ) -> Array:
@@ -855,19 +1092,20 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
     d = space.map_bond(d)
 
     N = position.shape[0]
-    sender_idx = jnp.broadcast_to(jnp.arange(N)[:, None], idx.shape)
+    sender_idx = jnp.broadcast_to(jnp.arange(N, dtype=i32)[:, None], idx.shape)
 
     sender_idx = jnp.reshape(sender_idx, (-1,))
     receiver_idx = jnp.reshape(idx, (-1,))
-    dR = d(position[sender_idx], position[receiver_idx])
+    # dR = d(position[sender_idx], position[receiver_idx])
 
-    mask = (dR < cutoff_sq) & (receiver_idx < N)
+    # mask = (dR < cutoff_sq) & (receiver_idx < N)
+    mask = (receiver_idx < N)
     if format is NeighborListFormat.OrderedSparse:
       mask = mask & (receiver_idx < sender_idx)
 
     out_idx = N * jnp.ones(receiver_idx.shape, i32)
 
-    cumsum = jnp.cumsum(mask)
+    cumsum = jnp.cumsum(mask, dtype=i32)
     index = jnp.where(mask, cumsum - 1, len(receiver_idx) - 1)
     receiver_idx = out_idx.at[index].set(receiver_idx)
     sender_idx = out_idx.at[index].set(sender_idx)
@@ -875,11 +1113,8 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
 
     return jnp.stack((receiver_idx, sender_idx)), max_occupancy
 
-  def neighbor_list_fn(position: Array,
-                       neighbors = None,
-                       extra_capacity: int = 0,
-                       **kwargs) -> NeighborList:
-    def neighbor_fn(position_and_error, max_occupancy=None):
+  def neighbor_fn(position_and_error, max_occupancy=None, neighbors=None,
+                  extra_capacity=0, **kwargs):  
       position, err = position_and_error
       N = position.shape[0]
 
@@ -908,7 +1143,8 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
         idx = candidate_fn(position.shape)
       else:
         err = err.update(PEC.CELL_LIST_OVERFLOW, cl.did_buffer_overflow)
-        idx = cell_list_candidate_fn(cl.id_buffer, position.shape)
+        # idx = cell_list_candidate_fn(cl.id_buffer, cl.particle_cell_id, position.shape)
+        idx = cell_list_candidate_fn(cl.id_buffer, cl.particle_cell_id, position.shape, metric_sq, position, cl.position_buffer)
         cl_capacity = cl.cell_capacity
 
       if mask_self:
@@ -949,11 +1185,18 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
           cl_fn,
           update_fn)  # pytype: disable=wrong-arg-count
 
+  def neighbor_list_fn(position: Array,
+                       neighbors = None,
+                       extra_capacity: int = 0,
+                       **kwargs) -> NeighborList:
+    
+    bound_neighbor_fn = partial(neighbor_fn, neighbors=neighbors, extra_capacity=extra_capacity, **kwargs)
+
     nbrs = neighbors
     if nbrs is None:
-      return neighbor_fn((position, PartitionError(jnp.zeros((), jnp.uint8))))
+      return bound_neighbor_fn((position, PartitionError(jnp.zeros((), jnp.uint8))))
 
-    neighbor_fn = partial(neighbor_fn, max_occupancy=nbrs.max_occupancy)
+    bound_neighbor_fn = partial(bound_neighbor_fn, max_occupancy=nbrs.max_occupancy)
 
     # If the box has been updated, then check that fractional coordinates are
     # enabled and that the cell list has big enough cells.
@@ -974,8 +1217,11 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
     d = vmap(d)
     return lax.cond(
         jnp.any(d(position, nbrs.reference_position) > threshold_sq),
-        (position, nbrs.error), neighbor_fn,
-        nbrs, lambda x: x)
+        (position, nbrs.error), 
+        bound_neighbor_fn,
+        nbrs, 
+        lambda x: x
+        )
 
   def allocate_fn(position: Array, extra_capacity: int = 0, **kwargs
                   ):
